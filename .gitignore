@@ -1,0 +1,49 @@
+# Entornos virtuales y secretos
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+ENV/
+env/
+
+# Cachés de Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Archivos temporales y de salida del proyecto (no versionar)
+temporal/
+salida/
+logs/
+*.log
+*.tmp
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
