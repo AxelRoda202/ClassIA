@@ -30,6 +30,11 @@ ANCHO_PAGE, ALTO_PAGE = A4
 MARGEN = 20 * mm
 
 
+def fecha_local() -> str:
+    """Fecha de generación calculada localmente, nunca tomada de la IA."""
+    return datetime.now().strftime("%d/%m/%Y")
+
+
 def escapar_texto(texto: str) -> str:
     """Escapa caracteres especiales para los componentes de ReportLab."""
     if not texto:
@@ -182,7 +187,7 @@ def construir_pdf(
         tema = metadatos.get("tema", "")
         nivel = metadatos.get("nivel", "")
         disciplina = metadatos.get("disciplina", "")
-        fecha = metadatos.get("fecha_generacion", datetime.now().strftime("%d/%m/%Y"))
+        fecha = fecha_local()
 
         doc = BaseDocTemplate(
             str(ruta_salida),
@@ -474,14 +479,15 @@ def _agregar_recurso_visual(
             alto = ancho * ratio
             img.drawWidth = ancho
             img.drawHeight = alto
-            elementos.append(Spacer(1, 3 * mm))
-            elementos.append(img)
+            bloque = [Spacer(1, 3 * mm), img]
             if caption:
-                elementos.append(Paragraph(
+                bloque.append(Paragraph(
                     f"<i>{escapar_texto(caption)}</i>",
                     estilos["pie"],
                 ))
-            elementos.append(Spacer(1, 2 * mm))
+            bloque.append(Spacer(1, 2 * mm))
+            # La imagen y su pie deben quedar en la misma página.
+            elementos.append(KeepTogether(bloque))
             return
         except Exception:
             pass
@@ -527,6 +533,10 @@ def _agregar_recurso_visual(
         ("LEFTPADDING", (0, 0), (-1, -1), 8),
         ("RIGHTPADDING", (0, 0), (-1, -1), 8),
     ]))
-    elementos.append(Spacer(1, 3 * mm))
-    elementos.append(tarjeta)
-    elementos.append(Spacer(1, 2 * mm))
+    # La tarjeta es un único bloque: si no cabe al final de la página, se
+    # mueve completa a la siguiente en lugar de cortarse en una franja.
+    elementos.append(KeepTogether([
+        Spacer(1, 3 * mm),
+        tarjeta,
+        Spacer(1, 2 * mm),
+    ]))

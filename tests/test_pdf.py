@@ -8,8 +8,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import unittest
 from pathlib import Path
+from reportlab.platypus import KeepTogether
 from modelos_datos import ejemplo_matematica, ejemplo_historia, ejemplo_recursos_humanos
-from generador_pdf import construir_pdf
+from generador_pdf import (
+    construir_pdf, fecha_local, _agregar_recurso_visual, crear_estilos,
+)
 from configuracion import CARPETA_SALIDA, CARPETA_TEMPORAL
 
 
@@ -68,6 +71,48 @@ class TestPDF(unittest.TestCase):
 
         self.assertIn("Funciones Cuadráticas", texto_total)
         self.assertGreater(len(texto_total), 100, "El PDF no debería estar vacío")
+
+    def test_pdf_ignora_fecha_inventada_por_la_ia(self):
+        """La portada usa la fecha local, aunque el JSON traiga otra fecha."""
+        material = ejemplo_matematica()
+        material["metadatos"]["fecha_generacion"] = "2023-10-01"
+        ruta_pdf = self.carpeta_prueba / "test_fecha_local.pdf"
+
+        antes = fecha_local()
+        exito = construir_pdf(material, {}, ruta_pdf)
+        despues = fecha_local()
+        self.assertTrue(exito)
+
+        import PyPDF2  # type: ignore
+        with open(ruta_pdf, "rb") as f:
+            lector = PyPDF2.PdfReader(f)
+            texto = lector.pages[0].extract_text() or ""
+
+        self.assertNotIn("2023-10-01", texto)
+        if antes == despues:
+            self.assertIn(antes, texto)
+
+    def test_tarjeta_de_recurso_no_se_parte_entre_paginas(self):
+        """La tarjeta amarilla se agrupa para no dejar una franja cortada."""
+        elementos = []
+        _agregar_recurso_visual(
+            elementos,
+            {
+                "id": "r1",
+                "type": "diagram",
+                "title": "Recurso de prueba",
+                "description": "Descripción del recurso.",
+                "educational_purpose": "Propósito del recurso.",
+                "data": {},
+            },
+            {},
+            crear_estilos(),
+        )
+
+        self.assertTrue(
+            any(isinstance(elemento, KeepTogether) for elemento in elementos),
+            "La tarjeta debe envolverse en KeepTogether",
+        )
 
     def test_preservacion_json_fallo_pdf(self):
         """9. Preservación del JSON cuando falla la generación del PDF."""

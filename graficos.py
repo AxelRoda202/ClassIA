@@ -6,7 +6,8 @@ Todos los gráficos se interpretan a partir de datos estructurados del JSON.
 No se ejecuta código generado por la IA.
 """
 import os
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
 import matplotlib
@@ -62,37 +63,164 @@ def _guardar_figura(fig, carpeta_destino: Path, nombre_archivo: str) -> str:
     return str(ruta)
 
 
+def _numero(valor: Any) -> Optional[float]:
+    """Convierte un valor numérico sin aceptar booleanos ni NaN/infinitos."""
+    if isinstance(valor, bool):
+        return None
+    try:
+        numero = float(valor)
+    except (TypeError, ValueError):
+        return None
+    if numero != numero or numero in (float("inf"), float("-inf")):
+        return None
+    return numero
+
+
+def _valores_serie(serie: Any) -> List[Any]:
+    """Acepta el formato canónico y las variantes que devuelve la IA."""
+    if isinstance(serie, dict):
+        for clave in ("valores", "y", "datos", "data"):
+            if clave in serie:
+                valores = serie.get(clave)
+                return list(valores) if isinstance(valores, (list, tuple)) else []
+        return []
+    if isinstance(serie, (list, tuple)):
+        return list(serie)
+    return []
+
+
+def _etiqueta_serie(serie: Any) -> str:
+    if isinstance(serie, dict):
+        for clave in ("etiqueta", "name", "label", "nombre"):
+            if serie.get(clave):
+                return str(serie[clave])
+    return "serie"
+
+
+def _eje_x(datos: Dict[str, Any], cantidad: int) -> List[Any]:
+    """Devuelve el eje X explícito o los índices si no fue provisto."""
+    for clave in ("x", "eje_x", "categorias"):
+        valores = datos.get(clave)
+        if isinstance(valores, (list, tuple)) and valores:
+            eje = []
+            for valor in valores[:cantidad]:
+                numero = _numero(valor)
+                eje.append(numero if numero is not None else str(valor))
+            return eje
+    return list(range(cantidad))
+
+
+def _normalizar_series_grafico(
+    datos: Dict[str, Any],
+) -> List[Tuple[str, List[Tuple[Any, float]]]]:
+    """
+    Normaliza las series a pares (x, y).
+
+    Los modelos a veces devuelven `{"name": ..., "y": [...]}` en lugar del
+    formato documentado `{"etiqueta": ..., "valores": [...]}`. Ambos son
+    válidos; antes el segundo formato producía un gráfico vacío.
+    """
+    series_raw = datos.get("series")
+    if not isinstance(series_raw, list) or not series_raw:
+        return []
+
+    resultado: List[Tuple[str, List[Tuple[Any, float]]]] = []
+    for serie in series_raw:
+        valores = _valores_serie(serie)
+        if not valores:
+            continue
+        eje_x = _eje_x(datos, len(valores))
+        pares: List[Tuple[Any, float]] = []
+        for indice, valor in enumerate(valores):
+            numero = _numero(valor)
+            if numero is None or indice >= len(eje_x):
+                continue
+            pares.append((eje_x[indice], numero))
+        if pares:
+            resultado.append((_etiqueta_serie(serie), pares))
+    return resultado
+
+
+def _etiquetas_desde_titulo(titulo: str) -> Optional[Tuple[str, str]]:
+    """
+    Deduce (x_label, y_label) de títulos como "Fuerza versus Aceleración".
+
+    Es sólo un respaldo para planes antiguos que no incluían x_label/y_label.
+    """
+    texto = re.sub(
+        r"^(gr[áa]fic[ao]|plot)\s+(de\s+)?", "", str(titulo or "").strip(),
+        flags=re.IGNORECASE,
+    )
+    separador = re.compile(
+        r"\s+(?:versus|vs\.?|frente\s+a)\s+", re.IGNORECASE
+    )
+    partes = separador.split(texto, maxsplit=1)
+    if len(partes) == 2 and partes[0].strip() and partes[1].strip():
+        return partes[1].strip(), partes[0].strip()
+    return None
+
+
 def _generar_grafico_numerico(
     datos: Dict[str, Any], titulo: str, carpeta_destino: Path, recurso_id: str
 ) -> Optional[str]:
     """Genera gráficos de líneas, barras o dispersión a partir de datos."""
-    series = datos.get("series", [])
+    series = _normalizar_series_grafico(datos)
     if not series:
         return None
 
-    tipo_grafico = datos.get("tipo_grafico", "lineas").lower()
+    tipo_grafico = str(
+        datos.get("tipo_grafico")
+        or datos.get("chart_type")
+        or datos.get("tipo")
+        or "lineas"
+    ).lower()
+    x_label = (
+        datos.get("x_label") or datos.get("etiqueta_x")
+        or datos.get("xlabel") or ""
+    )
+    y_label = (
+        datos.get("y_label") or datos.get("etiqueta_y")
+        or datos.get("ylabel") or ""
+    )
+    if not x_label or not y_label:
+        desde_titulo = _etiquetas_desde_titulo(titulo)
+        if desde_titulo:
+            x_titulo, y_titulo = desde_titulo
+            x_label = x_label or x_titulo
+            y_label = y_label or y_titulo
+    if not x_label:
+        x_label = "Categoría" if tipo_grafico == "barras" else "Índice"
+    if not y_label:
+        y_label = "Valor"
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
 
     if tipo_grafico == "barras":
-        x = range(len(series[0].get("valores", [])))
-        for s in series:
-            valores = s.get("valores", [])
-            ax.bar([str(i) for i in x], valores, label=s.get("etiqueta", "serie"))
-        ax.set_xlabel("Categoría")
+        for etiqueta, pares in series:
+            ax.bar(
+                [str(x) for x, _ in pares],
+                [y for _, y in pares],
+                label=etiqueta,
+            )
     elif tipo_grafico == "dispersion":
-        for s in series:
-            valores = s.get("valores", [])
-            ax.scatter(range(len(valores)), valores, label=s.get("etiqueta", "serie"))
-        ax.set_xlabel("Índice")
+        for etiqueta, pares in series:
+            ax.scatter(
+                [x for x, _ in pares],
+                [y for _, y in pares],
+                label=etiqueta,
+            )
     else:  # lineas por defecto
-        for s in series:
-            valores = s.get("valores", [])
-            ax.plot(valores, marker="o", label=s.get("etiqueta", "serie"))
-        ax.set_xlabel("Índice")
+        for etiqueta, pares in series:
+            ax.plot(
+                [x for x, _ in pares],
+                [y for _, y in pares],
+                marker="o",
+                label=etiqueta,
+            )
 
     ax.set_title(titulo, fontsize=12, color=COLOR_ROJO_INSTITUCIONAL)
-    ax.set_ylabel("Valor")
+    ax.set_xlabel(str(x_label))
+    ax.set_ylabel(str(y_label))
     ax.grid(True, alpha=0.3)
     ax.legend()
 

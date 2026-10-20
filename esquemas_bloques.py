@@ -13,6 +13,7 @@ Cada esquema es un diccionario con los campos obligatorios y
 opcionales, junto con su validación asociada.
 """
 from typing import Any, Dict, List, Optional, Tuple
+import re
 import unicodedata
 
 # ---------------------------------------------------------------------------
@@ -236,8 +237,92 @@ TIPOS_EJERCICIO_VALIDOS = {
     "aplicacion_practica",
 }
 
+# Vocabulario mínimo para detectar respuestas redactadas en inglés. No se
+# usa para traducir ni para corregir: sólo para rechazar un lote que no está
+# en el idioma del material antes de que llegue al PDF.
+_PALABRAS_INGLES = {
+    "the", "a", "an", "of", "and", "or", "to", "in", "on", "at", "by",
+    "for", "with", "from", "is", "are", "was", "were", "be", "been",
+    "this", "that", "these", "those", "it", "its", "as", "if", "then",
+    "how", "why", "what", "which", "when", "where", "who", "use", "using",
+    "calculate", "compute", "explain", "determine", "find", "given",
+    "show", "shows", "graph", "velocity", "acceleration", "force",
+    "mass", "time", "height", "ground", "rock", "dropped", "reach",
+    "metal", "spoon", "feels", "colder", "wooden", "room", "temperature",
+    "answer", "solution", "step", "first", "second", "third", "object",
+    "body", "motion", "energy", "work", "power", "can", "will", "would",
+    "should", "may", "might", "must", "not", "no", "yes", "between",
+    "over", "under", "after", "before", "during", "because", "about",
+    "more", "less", "than", "same", "different", "each", "every", "all",
+}
 
-def validar_lote_ejercicios(lote: Dict[str, Any]) -> Tuple[bool, List[str]]:
+_PALABRAS_ESPANOL = {
+    "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del",
+    "al", "a", "y", "o", "que", "en", "con", "por", "para", "se", "su",
+    "sus", "es", "son", "fue", "fueron", "ser", "estar", "como", "más",
+    "mas", "pero", "sobre", "entre", "cuando", "desde", "hasta", "sin",
+    "lo", "le", "les", "ya", "muy", "también", "tambien", "puede",
+    "deben", "debe", "calcula", "calcular", "explica", "explicar",
+    "determina", "determinar", "encuentra", "encuentrar", "dada", "dado",
+    "fuerza", "fuerzas", "masa", "aceleración", "aceleracion", "velocidad",
+    "cuerpo", "bloque", "plano", "inclinado", "newton", "ley", "leyes",
+    "movimiento", "inercia", "acción", "accion", "reacción", "reaccion",
+    "diagrama", "libre", "peso", "normal", "rozamiento", "tensión",
+    "tension", "gas", "ideal", "presión", "presion", "temperatura",
+    "volumen", "química", "quimica", "mol", "moles", "disolución",
+    "disolucion", "trabajo", "energía", "energia", "gráfico", "grafico",
+    "respuesta", "solución", "solucion", "explicación", "explicacion",
+    "datos", "pista", "consigna", "ejercicio", "actividad",
+}
+
+
+def _tokens_texto(texto: str) -> List[str]:
+    """Tokens alfabéticos normalizados, sin tildes y en minúsculas."""
+    normalizado = _sin_tildes(texto).lower()
+    return re.findall(r"[a-z]+", normalizado)
+
+
+def _parece_ingles(texto: str) -> bool:
+    """Heurística conservadora para detectar un texto redactado en inglés."""
+    tokens = _tokens_texto(texto)
+    if not tokens:
+        return False
+    ingles = sum(1 for token in tokens if token in _PALABRAS_INGLES)
+    espanol = sum(1 for token in tokens if token in _PALABRAS_ESPANOL)
+    if ingles >= 3 and ingles > espanol:
+        return True
+    # Consignas muy cortas como "Calculate force" no tienen suficientes
+    # tokens para la regla anterior.
+    return ingles >= 2 and espanol == 0 and len(tokens) <= 8
+
+
+def validar_idioma_ejercicios(lote: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Rechaza lotes cuyos ejercicios están redactados en inglés."""
+    errores: List[str] = []
+    if not isinstance(lote, dict):
+        return True, errores
+
+    campos = (
+        "consigna", "datos", "pista", "solucion", "respuesta_final",
+        "explicacion", "criterios_correccion",
+    )
+    for indice, ejercicio in enumerate(lote.get("ejercicios", []) or [], 1):
+        if not isinstance(ejercicio, dict):
+            continue
+        texto = " ".join(
+            str(ejercicio.get(campo) or "") for campo in campos
+        )
+        if _parece_ingles(texto):
+            errores.append(
+                f"Ejercicio {indice}: el contenido debe estar en español; "
+                "se detectó texto en inglés."
+            )
+    return (len(errores) == 0), errores
+
+
+def validar_lote_ejercicios(
+    lote: Dict[str, Any], exigir_espanol: bool = False
+) -> Tuple[bool, List[str]]:
     """Valida la estructura de un lote de ejercicios."""
     errores: List[str] = []
 
@@ -273,6 +358,10 @@ def validar_lote_ejercicios(lote: Dict[str, Any]) -> Tuple[bool, List[str]]:
                 if ej_id in ids_ej:
                     errores.append(f"ID de ejercicio duplicado: {ej_id}.")
                 ids_ej.add(ej_id)
+
+    if exigir_espanol:
+        _, errores_idioma = validar_idioma_ejercicios(lote)
+        errores.extend(errores_idioma)
 
     return (len(errores) == 0), errores
 
@@ -524,7 +613,6 @@ def esquema_json_componentes_finales() -> Dict[str, Any]:
             "nivel": {"type": "string"},
             "profundidad": {"type": "string"},
             "cantidad_actividades": {"type": "integer"},
-            "fecha_generacion": {"type": "string"},
             "generado_por_ia": {"type": "boolean"},
             "modo_demostracion": {"type": "boolean"},
         }),

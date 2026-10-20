@@ -21,7 +21,8 @@ from esquemas_bloques import (
     validar_documento_ensamblado,
 )
 from validador import validar_estructura_material
-from generador_pdf import construir_pdf
+from generador_pdf import construir_pdf, fecha_local
+from plantillas import obtener_instruccion_lote_ejercicios
 from configuracion import CARPETA_TEMPORAL
 
 
@@ -183,6 +184,99 @@ class TestGeneradorBloquesModoDemostracion(unittest.TestCase):
         self.assertTrue(exito)
         self.assertTrue(ruta_pdf.exists())
         self.assertGreater(ruta_pdf.stat().st_size, 1000)
+
+    def test_prompt_ejercicios_incluye_plan_y_espanol(self):
+        """Los ejercicios reciben el tema y las secciones, no sólo la materia."""
+        plan = {
+            "titulo": "Las Tres Leyes del Movimiento de Newton",
+            "disciplina": "Física y química",
+            "objetivos_aprendizaje": ["Comprender la inercia"],
+            "secciones": [
+                {
+                    "titulo": "Primera Ley de Newton: Principio de Inercia",
+                    "conceptos_principales": ["inercia", "fuerza neta"],
+                }
+            ],
+        }
+        prompt = obtener_instruccion_lote_ejercicios(
+            dificultad="inicial",
+            cantidad=3,
+            contador_inicio=1,
+            profundidad="estándar",
+            disciplina="Física y química",
+            plan=plan,
+        )
+
+        self.assertIn("Las Tres Leyes del Movimiento de Newton", prompt)
+        self.assertIn("Primera Ley de Newton: Principio de Inercia", prompt)
+        self.assertIn("inercia", prompt)
+        self.assertIn("español", prompt.lower())
+        self.assertIn("No incluyas ejercicios de química", prompt)
+
+    def test_ensamblado_ignora_fecha_de_la_ia(self):
+        """La fecha del documento se asigna al ensamblar, no se copia del JSON."""
+        generador = GeneradorBloques()
+        generador.plan = {
+            "titulo": "Tema",
+            "disciplina": "Física y química",
+            "nivel": "Secundario",
+            "profundidad": "breve",
+            "objetivos_aprendizaje": ["Objetivo"],
+            "conocimientos_previos": ["Previos"],
+            "secciones": [
+                {
+                    "id": "s1", "orden": 1, "titulo": "Sección",
+                    "conceptos_principales": ["Concepto"],
+                    "ejemplos_sugeridos": [],
+                    "recursos_visuales": [],
+                }
+            ],
+            "recursos_visuales_planificados": [],
+        }
+        generador.secciones_validadas = [
+            {
+                "seccion_id": "s1", "orden": 1, "titulo": "Sección",
+                "bloques": [
+                    {"tipo": "paragraph", "texto": "Contenido de prueba."}
+                ],
+            }
+        ]
+        generador.ejercicios_validos = [
+            {
+                "id": "act1", "dificultad": "inicial", "tipo": "calculo",
+                "consigna": "Calcula una fuerza.",
+                "solucion": "Se aplica F = m·a.",
+                "respuesta_final": "10 N",
+                "explicacion": "Se multiplica masa por aceleración.",
+                "criterios_correccion": "Verificar unidades.",
+            }
+        ]
+        generador.componentes_finales = {
+            "metadatos": {
+                "titulo": "Tema",
+                "tema": "Tema",
+                "disciplina": "Física y química",
+                "nivel": "Secundario",
+                "profundidad": "breve",
+                "cantidad_actividades": 1,
+                "fecha_generacion": "2023-10-01",
+                "generado_por_ia": True,
+                "modo_demostracion": False,
+            },
+            "introduccion": "Introducción.",
+            "resumen_final": "Resumen.",
+            "glosario": [{"termino": "Fuerza", "definicion": "Interacción."}],
+            "fuentes": [],
+        }
+
+        documento = generador._ensamblar_documento(1)
+
+        self.assertEqual(
+            documento["metadatos"]["fecha_generacion"], fecha_local()
+        )
+        self.assertNotEqual(
+            documento["metadatos"]["fecha_generacion"], "2023-10-01"
+        )
 
 
 if __name__ == "__main__":

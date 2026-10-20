@@ -13,6 +13,7 @@ from esquemas_bloques import (
     validar_lote_ejercicios,
     validar_componentes_finales,
     validar_documento_ensamblado,
+    esquema_json_componentes_finales,
 )
 
 
@@ -185,6 +186,59 @@ class TestEsquemasBloques(unittest.TestCase):
         self.assertFalse(valido)
         self.assertTrue(any("dificultad" in e.lower() for e in errores))
 
+    def test_lote_en_ingles_rechazado_si_se_exige_espanol(self):
+        """Un lote redactado en inglés no debe llegar al PDF."""
+        lote = {
+            "ejercicios": [
+                {
+                    "id": "act1",
+                    "dificultad": "inicial",
+                    "tipo": "calculo",
+                    "consigna": (
+                        "Calculate the force needed to accelerate a 2 kg "
+                        "mass at 3 m/s²."
+                    ),
+                    "datos": "mass = 2 kg, acceleration = 3 m/s²",
+                    "pista": "Use Newton's second law.",
+                    "solucion": "Force equals mass times acceleration.",
+                    "respuesta_final": "6 N",
+                    "explicacion": "The calculation uses F = m a.",
+                    "criterios_correccion": "Check the substitution and units.",
+                }
+            ],
+        }
+        valido, errores = validar_lote_ejercicios(
+            lote, exigir_espanol=True
+        )
+        self.assertFalse(valido)
+        self.assertTrue(any("español" in e for e in errores), errores)
+
+    def test_lote_en_espanol_aceptado(self):
+        """Un lote en español sigue siendo válido con la comprobación activa."""
+        lote = {
+            "ejercicios": [
+                {
+                    "id": "act1",
+                    "dificultad": "inicial",
+                    "tipo": "calculo",
+                    "consigna": (
+                        "Calcula la fuerza necesaria para acelerar una masa "
+                        "de 2 kg a 3 m/s²."
+                    ),
+                    "datos": "masa = 2 kg, aceleración = 3 m/s²",
+                    "pista": "Usa la segunda ley de Newton.",
+                    "solucion": "La fuerza es igual a la masa por la aceleración.",
+                    "respuesta_final": "6 N",
+                    "explicacion": "Se aplica la fórmula F = m·a.",
+                    "criterios_correccion": "Verificar el reemplazo y las unidades.",
+                }
+            ],
+        }
+        valido, errores = validar_lote_ejercicios(
+            lote, exigir_espanol=True
+        )
+        self.assertTrue(valido, errores)
+
     # ------------------------------------------------------------------
     # Componentes finales
     # ------------------------------------------------------------------
@@ -211,6 +265,11 @@ class TestEsquemasBloques(unittest.TestCase):
         }
         valido, errores = validar_componentes_finales(componentes)
         self.assertTrue(valido, f"Errores: {errores}")
+
+    def test_esquema_finales_no_solicita_fecha_a_la_ia(self):
+        """La fecha se calcula localmente; no forma parte del esquema de IA."""
+        metadatos = esquema_json_componentes_finales()["properties"]["metadatos"]
+        self.assertNotIn("fecha_generacion", metadatos["properties"])
 
     # ------------------------------------------------------------------
     # Documento ensamblado

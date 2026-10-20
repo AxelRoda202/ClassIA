@@ -5,7 +5,7 @@ Contiene la plantilla general y pequeñas adaptaciones por disciplina.
 La IA recibe una sola solicitud principal que incluye la clasificación
 y la generación pedagógica juntas.
 """
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 def plantilla_general(
@@ -51,7 +51,6 @@ ESTRUCTURA OBLIGATORIA DEL JSON:
     "nivel": "{nivel}",
     "profundidad": "{profundidad}",
     "cantidad_actividades": {cantidad_actividades},
-    "fecha_generacion": "",
     "generado_por_ia": true,
     "modo_demostracion": false
   }},
@@ -340,7 +339,15 @@ ESTRUCTURA OBLIGATORIA DEL JSON:
         "orden_relativo": 1
       }},
       "render_strategy": "python_chart",
-      "data": {{}},
+      "data": {{
+        "tipo_grafico": "lineas",
+        "x_label": "Eje X",
+        "y_label": "Eje Y",
+        "x": [0, 1, 2],
+        "series": [
+          {{"name": "Serie 1", "y": [0, 1, 2]}}
+        ]
+      }},
       "status": "pendiente",
       "generated_asset_path": ""
     }}
@@ -354,6 +361,14 @@ ESTRUCTURA OBLIGATORIA DEL JSON:
 
 TIPOS DE RECURSO VISUAL PERMITIDOS: python_chart, diagram, timeline, flowchart, table, ascii, external_image.
 POSICIONES PERMITIDAS: portada, antes_bloque, despues_bloque, integrado, final_seccion.
+
+DATOS DE LOS RECURSOS LOCALES (no dejes "data" vacío):
+- python_chart: "tipo_grafico" (lineas, barras o dispersion), "x_label", "y_label", "x" (lista de valores) y "series" (lista de objetos con "name" e "y").
+- timeline: "eventos" (lista de objetos con "anio" y "evento").
+- flowchart o diagram: "nodos" (lista de objetos con "id" y "texto") y "relaciones" (lista de objetos con "origen" y "destino").
+- table: "cabeceras" (lista de textos) y "filas" (lista de listas de textos).
+- ascii: "contenido" (texto).
+- external_image no necesita "data"; usá "image_generation_prompt".
 
 REGLA SOBRE TEXTO EN IMÁGENES:
 - No uses external_image para mapas conceptuales, diagramas, líneas de tiempo, tablas ni ningún recurso que necesite etiquetas, nombres, coordenadas o leyendas.
@@ -488,18 +503,66 @@ IMPORTANTE: Responde solo con el JSON. No uses bloques de código ```json.
     return instruccion
 
 
+def _contexto_plan_ejercicios(
+    plan: Optional[Dict[str, Any]], tema: str
+) -> str:
+    """Resume el tema y las secciones para anclar los ejercicios al plan."""
+    if not isinstance(plan, dict) or not plan:
+        return f"- Tema central: {tema or 'el tema indicado'}"
+
+    lineas = [f"- Tema central: {plan.get('titulo') or plan.get('tema') or tema}"]
+    disciplina = plan.get("disciplina") or ""
+    if disciplina:
+        lineas.append(f"- Disciplina del material: {disciplina}")
+
+    objetivos = [
+        str(o).strip() for o in (plan.get("objetivos_aprendizaje") or [])
+        if str(o).strip()
+    ]
+    if objetivos:
+        lineas.append("- Objetivos de aprendizaje: " + "; ".join(objetivos[:5]))
+
+    secciones = plan.get("secciones") or []
+    if isinstance(secciones, list) and secciones:
+        lineas.append("- Secciones y conceptos que podés evaluar:")
+        for indice, seccion in enumerate(secciones, 1):
+            if not isinstance(seccion, dict):
+                continue
+            conceptos = [
+                str(c).strip()
+                for c in (seccion.get("conceptos_principales") or [])
+                if str(c).strip()
+            ]
+            detalle = ": " + ", ".join(conceptos) if conceptos else ""
+            lineas.append(
+                f"  {indice}. {seccion.get('titulo', '')}{detalle}"
+            )
+    return "\n".join(lineas)
+
+
 def obtener_instruccion_lote_ejercicios(
     dificultad: str,
     cantidad: int,
     contador_inicio: int,
     profundidad: str,
     disciplina: str = "",
+    tema: str = "",
+    plan: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Construye la instrucción para generar un lote de ejercicios.
+
+    Incluye el tema y el plan aprobado para que el modelo no derive hacia
+    otras materias (por ejemplo, química dentro de un tema de física) ni
+    responda en otro idioma.
     """
+    contexto = _contexto_plan_ejercicios(plan, tema)
+
     instruccion = f"""
 Eres un docente experto. Vas a generar {cantidad} ejercicios de dificultad {dificultad}.
+
+CONTEXTO OBLIGATORIO DEL MATERIAL:
+{contexto}
 
 CONFIGURACIÓN:
 - Dificultad: {dificultad}
@@ -517,6 +580,9 @@ INSTRUCCIONES:
 6. Usa EXACTAMENTE los nombres de campo del ejemplo, en minúsculas y SIN TILDES: "solucion" (no "solución"), "explicacion" (no "explicación").
 7. Todos los campos del ejemplo son OBLIGATORIOS y no pueden faltar; sólo "datos" y "pista" pueden quedar como cadena vacía (""). No omitas "id", "dificultad", "tipo", "consigna", "solucion" ni "respuesta_final".
 8. La dificultad debe ser exactamente "{dificultad}" en TODOS los ejercicios.
+9. Escribe TODOS los campos en español neutro. No respondas en inglés, aunque el tema tenga un nombre en inglés.
+10. Cada ejercicio debe evaluar exclusivamente el tema central y alguno de los conceptos de las secciones listadas. No incluyas ejercicios de química, biología, historia ni de otras materias ajenas al tema.
+11. Si la disciplina abarca varias materias (por ejemplo, "Física y química"), elegí solamente la materia del tema central. No mezcles temas de la otra materia.
 
 TIPOS DE EJERCICIO PERMITIDOS: calculo, analisis_conceptual, asociacion_conceptos, interpretacion_graficos, identificacion_errores, seleccion_justificada, desarrollo_escrito, estudio_de_casos, aplicacion_practica.
 
@@ -572,6 +638,7 @@ INSTRUCCIONES:
 5. No inventes fuentes, autores ni citas. El campo "fuentes" queda vacío.
 6. Usa EXACTAMENTE los nombres de campo del ejemplo: minúsculas y SIN TILDES.
 7. Todos los campos del ejemplo son OBLIGATORIOS: no omitas "resumen_final", "glosario" ni "metadatos". "metadatos" debe incluir titulo, tema, disciplina y nivel.
+8. No inventes ni devuelvas una fecha de generación: el programa la asigna localmente.
 
 ESTRUCTURA OBLIGATORIA DEL JSON:
 {{
@@ -583,7 +650,6 @@ ESTRUCTURA OBLIGATORIA DEL JSON:
     "nivel": "nivel educativo",
     "profundidad": "profundidad solicitada",
     "cantidad_actividades": {num_ejercicios},
-    "fecha_generacion": "",
     "generado_por_ia": true,
     "modo_demostracion": false
   }},

@@ -8,7 +8,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import unittest
 from pathlib import Path
-from graficos import generar_grafico_desde_recurso
+from graficos import (
+    generar_grafico_desde_recurso,
+    _normalizar_series_grafico,
+    _etiquetas_desde_titulo,
+)
 from configuracion import CARPETA_TEMPORAL
 
 
@@ -107,6 +111,50 @@ class TestGraficos(unittest.TestCase):
         ruta = generar_grafico_desde_recurso(recurso, self.carpeta_prueba)
         self.assertIsNotNone(ruta)
         self.assertTrue(Path(ruta).exists())
+
+    def test_grafico_acepta_formato_name_y(self):
+        """La IA puede devolver {"name": ..., "y": [...]}; no debe quedar vacío."""
+        datos = {
+            "x": [0, 1, 2, 3],
+            "series": [
+                {"name": "m = 1 kg", "y": [0, 1, 2, 3]},
+                {"name": "m = 2 kg", "y": [0, 2, 4, 6]},
+            ],
+        }
+        normalizadas = _normalizar_series_grafico(datos)
+
+        self.assertEqual(len(normalizadas), 2)
+        self.assertEqual(normalizadas[0][0], "m = 1 kg")
+        self.assertEqual([y for _, y in normalizadas[0][1]], [0, 1, 2, 3])
+        self.assertEqual([x for x, _ in normalizadas[1][1]], [0, 1, 2, 3])
+
+        recurso = {
+            "id": "test_name_y",
+            "type": "python_chart",
+            "title": "Fuerza versus aceleración",
+            "data": datos,
+        }
+        ruta = generar_grafico_desde_recurso(recurso, self.carpeta_prueba)
+        self.assertIsNotNone(ruta)
+        self.assertTrue(Path(ruta).exists())
+
+    def test_titulo_versus_define_los_ejes(self):
+        """Un título "Fuerza versus Aceleración" orienta los ejes X/Y."""
+        etiquetas = _etiquetas_desde_titulo(
+            "Gráfica de Fuerza versus Aceleración"
+        )
+        self.assertEqual(etiquetas, ("Aceleración", "Fuerza"))
+
+    def test_grafico_sin_series_no_genera_imagen_vacia(self):
+        """Sin datos válidos no se genera un gráfico en blanco."""
+        recurso = {
+            "id": "test_vacio",
+            "type": "python_chart",
+            "title": "Sin datos",
+            "data": {"series": []},
+        }
+        ruta = generar_grafico_desde_recurso(recurso, self.carpeta_prueba)
+        self.assertIsNone(ruta)
 
     def test_tipo_no_soporte_devuelve_none(self):
         """Un tipo de recurso no soportado debe devolver None sin fallar."""

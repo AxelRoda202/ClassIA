@@ -860,6 +860,8 @@ class GeneradorBloques:
             contador_inicio=contador_inicio,
             profundidad=profundidad,
             disciplina=self.plan.get("disciplina", "") if self.plan else "",
+            tema=self.plan.get("titulo", "") if self.plan else "",
+            plan=self.plan,
         )
 
         nombre_esquema, esquema, estricto = obtener_esquema_openrouter(
@@ -873,7 +875,7 @@ class GeneradorBloques:
             completo = _completar_campos_derivables_ejercicios(
                 normalizado, dificultad, contador_inicio
             )
-            return validar_lote_ejercicios(completo)
+            return validar_lote_ejercicios(completo, exigir_espanol=True)
 
         ultimo_error = ""
         for intento in range(MAX_REINTENTOS_BLOQUE):
@@ -910,7 +912,9 @@ class GeneradorBloques:
                 lote = _completar_campos_derivables_ejercicios(
                     lote, dificultad, contador_inicio
                 )
-                exito, errores = validar_lote_ejercicios(lote)
+                exito, errores = validar_lote_ejercicios(
+                    lote, exigir_espanol=True
+                )
                 if not exito:
                     ultimo_error = (
                         f"Lote de ejercicios no válido: {'; '.join(errores)}"
@@ -926,7 +930,9 @@ class GeneradorBloques:
                         "debe incluir, sin excepción y sin dejar vacíos: id, "
                         "dificultad, tipo, consigna, solucion y "
                         "respuesta_final. La dificultad de TODOS los "
-                        f"ejercicios debe ser exactamente '{dificultad}'."
+                        f"ejercicios debe ser exactamente '{dificultad}'. "
+                        "Redactá todo en español y limitate al tema central "
+                        "y a las secciones indicadas."
                     )
                     continue
 
@@ -1281,8 +1287,19 @@ class GeneradorBloques:
                 "No hay componentes finales para ensamblar el documento."
             )
 
+        metadatos_finales = self.componentes_finales.get("metadatos", {})
+        if not isinstance(metadatos_finales, dict):
+            metadatos_finales = {}
+        else:
+            metadatos_finales = dict(metadatos_finales)
+        # La fecha es un dato local, no una invención del modelo. Se asigna
+        # siempre al ensamblar para que un JSON viejo no vuelva a mostrarla.
+        metadatos_finales["fecha_generacion"] = (
+            datetime.datetime.now().strftime("%d/%m/%Y")
+        )
+
         documento = {
-            "metadatos": self.componentes_finales.get("metadatos", {}),
+            "metadatos": metadatos_finales,
             "objetivos_aprendizaje": self.plan.get("objetivos_aprendizaje", []),
             "conocimientos_previos": self.plan.get("conocimientos_previos", []),
             "introduccion": self.componentes_finales.get("introduccion", ""),
