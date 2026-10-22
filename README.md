@@ -71,24 +71,45 @@ Copia `.env.example` a `.env`:
 Copy-Item .env.example .env
 ```
 
-Edita `.env` y configura al menos una de las claves:
+Edita `.env` y configura al menos una de las claves. El orden objetivo es
+Gemini, NVIDIA, Groq y OpenRouter; los proveedores sin clave o sin modelos
+candidatos se omiten automáticamente.
 
 ```ini
 GEMINI_API_KEY=tu_clave_de_gemini
 GEMINI_MODEL=gemini-3.8-flash
 
+# NVIDIA NIM directo (requiere clave y al menos un modelo habilitado)
+NVIDIA_API_KEY=
+NVIDIA_MODEL=
+NVIDIA_MODELS=
+NVIDIA_RESPONSE_FORMAT=guided_json
+
+# Groq directo (opcional; requiere clave y al menos un modelo)
+GROQ_API_KEY=
+GROQ_MODEL=
+GROQ_MODELS=
+GROQ_RESPONSE_FORMAT=json_object
+
 OPENROUTER_API_KEY=tu_clave_de_openrouter
 OPENROUTER_MODEL=openrouter/free
 
-AI_PROVIDER_ORDER=gemini,openrouter
+AI_PROVIDER_ORDER=gemini,nvidia,groq,openrouter
 
 # Modo demostración (1 = activar, 0 = desactivar)
 AULA_IA_DEMO=0
 ```
 
+Los identificadores de NVIDIA y Groq que aparecen en `.env.example` son
+**candidatos pendientes de verificación**, no modelos gratuitos garantizados.
+Ver la guía [docs/proveedores_ia.md](docs/proveedores_ia.md) para el detalle de
+la jerarquía, los formatos estructurados y el diagnóstico manual.
+
 ### Cómo obtener las claves
 
 - **Gemini**: https://aistudio.google.com/app/apikey (Google AI Studio)
+- **NVIDIA NIM**: https://build.nvidia.com/settings
+- **Groq**: https://console.groq.com/keys
 - **OpenRouter**: https://openrouter.ai/keys
 
 No compartas tus claves. El archivo `.env` está incluido en `.gitignore` y no debe subirse a control de versiones.
@@ -171,7 +192,7 @@ Las pruebas no realizan llamadas reales a APIs externas. Usan sustitutos (mocks)
 | `main.py` | Inicia la aplicación Flet |
 | `interfaz.py` | Construye y gestiona la UI |
 | `generador_ia.py` | Coordina el flujo: IA, validación, gráficos, PDF, recuperación |
-| `proveedores_ia.py` | Adaptadores para Gemini, OpenRouter y OmniRoute (opcional) |
+| `proveedores_ia.py` | Adaptadores directos para Gemini, NVIDIA NIM, Groq y OpenRouter; clasificación de errores y fallback |
 | `plantillas.py` | Instrucciones pedagógicas y adaptaciones por disciplina |
 | `modelos_datos.py` | Estructura del JSON esperado y ejemplos de demostración |
 | `validador.py` | Validación estructural de respuestas JSON |

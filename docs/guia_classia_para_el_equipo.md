@@ -991,14 +991,23 @@ Transformación real observada:
 `configuracion.AI_PROVIDER_ORDER` se define con:
 
 ```python
-os.getenv("AI_PROVIDER_ORDER", "gemini,openrouter").split(",")
+AI_PROVIDER_ORDER = _normalizar_orden_proveedores(
+    os.getenv("AI_PROVIDER_ORDER", "gemini,nvidia,groq,openrouter")
+)
 ```
 
 `_orden_proveedores()` en `generador_bloques.py` filtra por `proveedor_esta_configurado(nombre)`:
 
 - `gemini`: requiere `GEMINI_API_KEY`.
+- `nvidia`: requiere `NVIDIA_API_KEY` y al menos un modelo en `NVIDIA_MODEL`/`NVIDIA_MODELS`.
+- `groq`: requiere `GROQ_API_KEY` y al menos un modelo en `GROQ_MODEL`/`GROQ_MODELS`.
 - `openrouter`: requiere `OPENROUTER_API_KEY`.
 - `omniroute`: requiere `OMNIROUTE_BASE_URL` y `OMNIROUTE_API_KEY`, pero su función **siempre lanza “no implementado”**.
+
+Los proveedores sin credenciales o sin modelos candidatos se omiten sin
+interrumpir la generación. El detalle de configuración, diagnóstico manual y
+estado de verificación está en
+[`docs/proveedores_ia.md`](proveedores_ia.md).
 
 ### 8.2. Prompts por etapa
 
@@ -1034,15 +1043,39 @@ La plantilla de sección teórica incluye los **ids exactos** de los recursos vi
 8. Recuerda en `modelos_agotados` los 404, los 400/422 por esquema no admitido y los 429 con cuota persistente.
 9. Si se agotan todos, lanza `ErrorModelosAgotados`; el flujo de bloques **no repite** el lote para no multiplicar llamadas.
 
+### 8.4.1. NVIDIA NIM y Groq directos
+
+`generar_con_nvidia_estructurado` y `generar_con_groq_estructurado` usan una
+API compatible con OpenAI, pero **no pasan por OpenRouter ni OmniRoute**:
+
+- NVIDIA: `https://integrate.api.nvidia.com/v1/chat/completions`.
+- Groq: `https://api.groq.com/openai/v1/chat/completions`.
+
+Ambos reciben el esquema real de la etapa, lo validan localmente y recorren
+sólo los modelos candidatos habilitados en `.env`. Un 401/403, un error de red,
+un 429 o un 5xx aborta ese proveedor sin probar todos sus modelos. Un modelo
+inexistente, un 400/422 de formato o una respuesta vacía/truncada/JSON
+inválido/fuera de esquema pasa al siguiente candidato.
+
+NVIDIA usa `nvext.guided_json` por defecto (`NVIDIA_RESPONSE_FORMAT=guided_json`),
+json_object como alternativa y validación local siempre. Groq usa
+`response_format=json_object` por defecto. La compatibilidad real de cada
+formato debe comprobarse con el diagnóstico manual y una cuenta válida.
+
 ### 8.5. Recuperación por proveedor y cuota
 
 `generar_contenido_educativo` recorre el orden configurado. Ante:
 
 - `ErrorClaveInvalida`: registra y pasa al siguiente.
+- `ErrorModeloNoDisponible`: dentro de NVIDIA/Groq/OpenRouter se omite el modelo y se prueba el siguiente candidato habilitado.
+- `ErrorLimiteSolicitudes`: registra y pasa al siguiente proveedor; no recorre todos los modelos del mismo proveedor.
 - `ErrorCuotaAgotada`: si `cuota_es_persistente()` detecta `PerDay` o `retry in Nh`, agrega el proveedor a `proveedores_agotados` y lo omite el resto de la ejecución.
-- `ErrorRed`, `ErrorServidor`, `ErrorRespuestaIncompleta`: registra y pasa al siguiente.
+- `ErrorRed`/`ErrorTimeout`, `ErrorServidor`, `ErrorRespuestaVacia`, `ErrorJSONInvalido`, `ErrorRespuestaTruncada` o `ErrorRespuestaInvalida`: registra y pasa al siguiente proveedor/modelo según corresponda.
 - `ErrorIntegracion`: **aborta de inmediato**, no prueba otros proveedores.
 - `ErrorModelosAgotados`: guarda el fallo y sigue con el siguiente proveedor; al final, si no hubo ninguno válido, lo propaga.
+
+La validación de esquema local se mantiene para Gemini, NVIDIA, Groq y
+OpenRouter. Un JSON sintácticamente válido pero fuera de esquema no se acepta.
 
 ### 8.6. Reintentos por bloque
 

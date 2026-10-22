@@ -1075,7 +1075,8 @@ class AulaIAApp:
             f"Modo demostración: {'activado' if MODO_DEMOSTRACION else 'desactivado'}\n"
             f"Proveedores configurados: {', '.join(proveedores) if proveedores else 'ninguno'}\n\n"
             "Edita el archivo .env en la carpeta del proyecto para configurar "
-            "GEMINI_API_KEY y OPENROUTER_API_KEY."
+            "GEMINI_API_KEY, NVIDIA_API_KEY con sus modelos candidatos, "
+            "GROQ_API_KEY con sus modelos candidatos u OPENROUTER_API_KEY."
         )
 
         dialogo = ft.AlertDialog(

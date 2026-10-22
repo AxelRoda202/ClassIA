@@ -1648,8 +1648,10 @@ class GeneradorBloques:
 
         except ErrorModelosAgotados as e:
             mensaje = (
-                "Ningún modelo gratuito de OpenRouter devolvió una respuesta "
-                "válida. Revisá OPENROUTER_MODELS y ejecutá el diagnóstico: "
+                "Ningún modelo configurado (NVIDIA, Groq u OpenRouter) "
+                "devolvió una respuesta válida. Revisá las listas de modelos "
+                "en .env y ejecutá el diagnóstico correspondiente: "
+                "python tools/diagnostico_nvidia.py o "
                 "python tools/diagnostico_openrouter_json.py --catalogo. "
                 "Los bloques ya validados quedaron guardados para reanudar. "
                 f"Detalle: {e}"

@@ -2,8 +2,9 @@
 """
 Proveedores de inteligencia artificial.
 
-Implementa adaptadores para Gemini (google-genai) y OpenRouter (API REST).
-Incluye clasificación de errores y orden de proveedores configurable.
+Implementa adaptadores para Gemini (google-genai), NVIDIA NIM, Groq y
+OpenRouter (API REST compatible con OpenAI). Incluye clasificación de errores,
+validación local de esquemas y orden de proveedores configurable.
 """
 import json
 import logging
@@ -13,14 +14,30 @@ from datetime import datetime
 
 from configuracion import (
     GEMINI_API_KEY, GEMINI_MODEL,
+    NVIDIA_API_KEY, NVIDIA_BASE_URL, NVIDIA_MODELS,
+    NVIDIA_RESPONSE_FORMAT,
+    GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODELS, GROQ_RESPONSE_FORMAT,
     OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_MODELS,
     OPENROUTER_RESPONSE_FORMAT,
     OMNIROUTE_BASE_URL, OMNIROUTE_API_KEY, OMNIROUTE_MODEL,
     TIMEOUT_SEGUNDOS, MAX_REINTENTOS, TOKEN_MAX_SALIDA,
-    proveedor_esta_configurado,
+    proveedor_esta_configurado, motivo_proveedor_no_configurado,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _limpiar_cercas_markdown(texto: str) -> str:
+    """Quita las cercas ``` que algunos modelos agregan alrededor del JSON."""
+    limpio = (texto or "").strip()
+    if not limpio.startswith("```"):
+        return limpio
+    lineas = limpio.splitlines()
+    if lineas and lineas[0].strip().startswith("```"):
+        lineas = lineas[1:]
+    if lineas and lineas[-1].strip().startswith("```"):
+        lineas = lineas[:-1]
+    return "\n".join(lineas).strip()
 
 
 class ErrorIA(Exception):
@@ -34,12 +51,28 @@ class ErrorClaveInvalida(ErrorIA):
 
 
 class ErrorCuotaAgotada(ErrorIA):
-    """Se agotó la cuota gratuita."""
+    """Se agotó la cuota disponible del proveedor."""
+    pass
+
+
+class ErrorLimiteSolicitudes(ErrorCuotaAgotada):
+    """
+    El proveedor rechazó la solicitud por límite de solicitudes (429).
+
+    Es una subclase de ErrorCuotaAgotada para que los flujos existentes sigan
+    tratándolo como un error recuperable, pero permite distinguir un límite
+    temporal de un agotamiento de cuota.
+    """
     pass
 
 
 class ErrorRed(ErrorIA):
     """Problema de conectividad de red."""
+    pass
+
+
+class ErrorTimeout(ErrorRed):
+    """El proveedor no respondió dentro del tiempo configurado."""
     pass
 
 
@@ -50,6 +83,21 @@ class ErrorServidor(ErrorIA):
 
 class ErrorRespuestaIncompleta(ErrorIA):
     """La respuesta del modelo está incompleta o no es JSON válido."""
+    pass
+
+
+class ErrorRespuestaVacia(ErrorRespuestaIncompleta):
+    """El proveedor respondió con éxito pero sin contenido final."""
+    pass
+
+
+class ErrorRespuestaTruncada(ErrorRespuestaIncompleta):
+    """El proveedor cortó la respuesta por el límite de tokens."""
+    pass
+
+
+class ErrorJSONInvalido(ErrorRespuestaIncompleta):
+    """El texto recibido no puede analizarse como JSON."""
     pass
 
 
@@ -131,10 +179,12 @@ def clasificar_error(excepcion: Exception) -> ErrorIA:
     if isinstance(codigo, int):
         if codigo in (401, 403):
             return ErrorClaveInvalida(str(excepcion))
-        if codigo == 429:
-            return ErrorCuotaAgotada(str(excepcion))
+        if codigo == 404:
+            return ErrorModeloNoDisponible(str(excepcion))
         if codigo == 408:
-            return ErrorRed(str(excepcion))
+            return ErrorTimeout(str(excepcion))
+        if codigo == 429:
+            return ErrorLimiteSolicitudes(str(excepcion))
         if 500 <= codigo < 600:
             return ErrorServidor(str(excepcion))
 
@@ -142,19 +192,42 @@ def clasificar_error(excepcion: Exception) -> ErrorIA:
 
     if "api key" in mensaje or "authentication" in mensaje or "unauthorized" in mensaje or "401" in mensaje or "403" in mensaje:
         return ErrorClaveInvalida(str(excepcion))
-    if "quota" in mensaje or "rate limit" in mensaje or "429" in mensaje or "excedido" in mensaje:
+    if (
+        "model not found" in mensaje or "model does not exist" in mensaje
+        or "unknown model" in mensaje or "404" in mensaje
+        or "no such model" in mensaje
+    ):
+        return ErrorModeloNoDisponible(str(excepcion))
+    if "quota" in mensaje or "excedido" in mensaje:
         return ErrorCuotaAgotada(str(excepcion))
+    if "rate limit" in mensaje or "too many requests" in mensaje or "429" in mensaje:
+        return ErrorLimiteSolicitudes(str(excepcion))
     if (
         "500" in mensaje or "502" in mensaje or "503" in mensaje
         or "504" in mensaje or "server" in mensaje or "deadline" in mensaje
     ):
         return ErrorServidor(str(excepcion))
-    if "timeout" in mensaje or "connection" in mensaje or "network" in mensaje:
+    if "timed out" in mensaje or "timeout" in mensaje:
+        return ErrorTimeout(str(excepcion))
+    if "connection" in mensaje or "network" in mensaje:
         return ErrorRed(str(excepcion))
-    if "json" in mensaje or "truncat" in mensaje or "incomplet" in mensaje:
-        return ErrorRespuestaIncompleta(str(excepcion))
+    if "truncat" in mensaje or "incomplet" in mensaje:
+        return ErrorRespuestaTruncada(str(excepcion))
+    if "schema" in mensaje or "validación" in mensaje or "validation" in mensaje:
+        return ErrorRespuestaInvalida(str(excepcion))
+    if "json" in mensaje:
+        return ErrorJSONInvalido(str(excepcion))
 
     return ErrorIA(str(excepcion))
+
+
+def _codigo_http(excepcion: Exception) -> Optional[int]:
+    """Extrae un código HTTP de una excepción o respuesta simulada."""
+    for atributo in ("status_code", "code"):
+        valor = getattr(excepcion, atributo, None)
+        if isinstance(valor, int):
+            return valor
+    return None
 
 
 def cuota_es_persistente(mensaje: str) -> bool:
@@ -288,11 +361,16 @@ def generar_con_gemini(
         motivo = _motivo_finalizacion_gemini(respuesta)
         if motivo:
             logger.warning(f"Gemini devolvió respuesta vacía. motivo={motivo}")
-            raise ErrorRespuestaIncompleta(
+            if str(motivo).upper() == "MAX_TOKENS":
+                raise ErrorRespuestaTruncada(
+                    f"Gemini truncó la respuesta por límite de tokens "
+                    f"(motivo: {motivo})."
+                )
+            raise ErrorRespuestaVacia(
                 f"Gemini devolvió una respuesta vacía (motivo: {motivo})."
             )
 
-        raise ErrorRespuestaIncompleta("Gemini devolvió una respuesta vacía.")
+        raise ErrorRespuestaVacia("Gemini devolvió una respuesta vacía.")
 
     except ErrorIA:
         raise
@@ -320,6 +398,422 @@ def _motivo_finalizacion_gemini(respuesta: Any) -> str:
         return str(getattr(motivo, "name", motivo))
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Utilidades comunes para proveedores compatibles con OpenAI
+# ---------------------------------------------------------------------------
+
+def _validar_json_texto(
+    texto: str,
+    validador: Optional[Callable[[Any], Tuple[bool, List[str]]]],
+    proveedor: str = "",
+    modelo: str = "",
+) -> Any:
+    """
+    Analiza y valida localmente un texto JSON.
+
+    Un JSON sintácticamente válido no se acepta si el validador de ClassIA lo
+    rechaza. La validación local se aplica siempre, aun cuando el proveedor
+    haya usado salida estructurada.
+    """
+    etiqueta = proveedor or "proveedor"
+    if modelo:
+        etiqueta += f" ({modelo})"
+    if not texto or not str(texto).strip():
+        raise ErrorRespuestaVacia(f"{etiqueta} devolvió una respuesta vacía.")
+
+    limpio = _limpiar_cercas_markdown(str(texto))
+    try:
+        datos = json.loads(limpio)
+    except json.JSONDecodeError as e:
+        raise ErrorJSONInvalido(
+            f"{etiqueta} devolvió JSON inválido o truncado: {e.msg} "
+            f"(posición {e.pos})."
+        )
+    if not isinstance(datos, (dict, list)):
+        raise ErrorRespuestaInvalida(
+            f"{etiqueta} devolvió un JSON que no es objeto ni lista."
+        )
+
+    if validador is not None:
+        try:
+            ok, errores = validador(datos)
+        except Exception as e:
+            raise ErrorRespuestaInvalida(
+                f"No se pudo validar la respuesta de {etiqueta} contra el "
+                f"esquema: {e}"
+            )
+        if not ok:
+            raise ErrorRespuestaInvalida(
+                "; ".join(errores[:5]) or "la respuesta no cumple el esquema."
+            )
+    return datos
+
+
+def _solicitar_chat_compatible(
+    url: str,
+    api_key: str,
+    modelo: str,
+    instruccion: str,
+    extras: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Realiza exactamente una solicitud a una API compatible con OpenAI.
+
+    No reintenta ni cambia de modelo. Los errores de red se convierten en
+    ErrorTimeout/ErrorRed y las respuestas se devuelven sin evaluar para que
+    el llamador decida si prueba otro modelo.
+    """
+    import requests
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload: Dict[str, Any] = {
+        "model": modelo,
+        "messages": [
+            {"role": "system", "content": (
+                "Responde ÚNICAMENTE con un objeto JSON válido que cumpla "
+                "exactamente el esquema solicitado. No uses bloques de código "
+                "markdown. No agregues texto fuera del JSON."
+            )},
+            {"role": "user", "content": instruccion},
+        ],
+        "temperature": 0.4,
+        "max_tokens": TOKEN_MAX_SALIDA,
+        "stream": False,
+    }
+    if extras:
+        payload.update(extras)
+
+    try:
+        respuesta = requests.post(
+            url, headers=headers, json=payload, timeout=TIMEOUT_SEGUNDOS
+        )
+    except requests.Timeout as e:
+        raise ErrorTimeout(
+            f"El proveedor no respondió dentro de {TIMEOUT_SEGUNDOS} segundos."
+        ) from e
+    except requests.ConnectionError as e:
+        raise ErrorRed("No se pudo conectar con el proveedor.") from e
+    except requests.RequestException as e:
+        raise ErrorRed(f"Error de red con el proveedor: {e}") from e
+
+    try:
+        cuerpo = respuesta.json()
+    except Exception:
+        cuerpo = None
+
+    logger.info(
+        "Proveedor compatible OpenAI: respuesta HTTP status=%s "
+        "modelo_solicitado=%s longitud_cuerpo=%d",
+        respuesta.status_code, modelo, len(respuesta.text or ""),
+    )
+    return {
+        "status": respuesta.status_code,
+        "cuerpo": cuerpo,
+        "texto_crudo": (respuesta.text or "")[:300],
+        "modelo_solicitado": modelo,
+    }
+
+
+def _evaluar_respuesta_chat_compatible(
+    resultado: Dict[str, Any],
+    validador: Optional[Callable[[Any], Tuple[bool, List[str]]]],
+    proveedor: str,
+) -> Dict[str, Any]:
+    """Clasifica y valida una respuesta de una API compatible con OpenAI."""
+    status = int(resultado.get("status") or 0)
+    cuerpo = resultado.get("cuerpo")
+    modelo_solicitado = str(resultado.get("modelo_solicitado") or "")
+    mensaje_error = _mensaje_error_openrouter(cuerpo)
+    texto_crudo = (resultado.get("texto_crudo") or "").strip()
+
+    if status in (401, 403):
+        raise ErrorClaveInvalida(
+            f"Clave de {proveedor} inválida o sin permisos (HTTP {status})."
+        )
+    if status == 404:
+        raise ErrorModeloNoDisponible(
+            f"Modelo de {proveedor} no disponible (404): "
+            f"'{modelo_solicitado}'."
+        )
+    if status == 429:
+        raise ErrorLimiteSolicitudes(
+            f"{proveedor} rechazó la solicitud por límite de solicitudes "
+            f"(429). Detalle: {mensaje_error or 'sin detalle'}"
+        )
+    if status in (400, 422):
+        raise ErrorModeloNoDisponible(
+            f"{proveedor} rechazó la solicitud (HTTP {status}) para "
+            f"'{modelo_solicitado}': {mensaje_error or texto_crudo or 'sin detalle'}"
+        )
+    if status >= 500:
+        raise ErrorServidor(
+            f"Error del servidor de {proveedor} (HTTP {status}) para "
+            f"'{modelo_solicitado}'."
+        )
+    if status != 200:
+        raise ErrorIA(
+            f"Error de {proveedor} (HTTP {status}) para "
+            f"'{modelo_solicitado}': {mensaje_error or texto_crudo or 'sin detalle'}"
+        )
+
+    if isinstance(cuerpo, dict) and cuerpo.get("error"):
+        detalle = mensaje_error or "error sin detalle"
+        bajo = detalle.lower()
+        if "unauthorized" in bajo or "api key" in bajo or "authentication" in bajo:
+            raise ErrorClaveInvalida(f"{proveedor}: {detalle}")
+        if "model" in bajo and ("not found" in bajo or "does not exist" in bajo):
+            raise ErrorModeloNoDisponible(f"{proveedor}: {detalle}")
+        if "quota" in bajo:
+            raise ErrorCuotaAgotada(f"{proveedor}: {detalle}")
+        if "rate limit" in bajo or "too many requests" in bajo or "429" in bajo:
+            raise ErrorLimiteSolicitudes(f"{proveedor}: {detalle}")
+        raise ErrorIA(f"{proveedor} devolvió un error lógico: {detalle}")
+
+    opciones = cuerpo.get("choices") if isinstance(cuerpo, dict) else None
+    if not isinstance(opciones, list) or not opciones:
+        raise ErrorRespuestaVacia(
+            f"{proveedor} no devolvió 'choices' en la respuesta."
+        )
+
+    opcion = opciones[0] if isinstance(opciones[0], dict) else {}
+    mensaje = opcion.get("message") or {}
+    if not isinstance(mensaje, dict):
+        mensaje = {}
+    texto = _texto_de_contenido_openrouter(mensaje)
+    motivo = opcion.get("finish_reason")
+    hubo_razonamiento = bool(
+        mensaje.get("reasoning") or mensaje.get("reasoning_details")
+    )
+
+    if motivo == "length":
+        raise ErrorRespuestaTruncada(
+            f"{proveedor} truncó la respuesta por límite de tokens "
+            "(finish_reason=length)."
+        )
+    if motivo == "content_filter":
+        raise ErrorRespuestaIncompleta(
+            f"{proveedor} bloqueó la respuesta por el filtro de contenido "
+            "(finish_reason=content_filter)."
+        )
+    if not texto:
+        detalle = f"contenido final vacío (finish_reason={motivo})"
+        if hubo_razonamiento:
+            detalle += "; el modelo sólo devolvió razonamiento"
+        raise ErrorRespuestaVacia(f"{proveedor} devolvió {detalle}.")
+
+    _validar_json_texto(texto, validador, proveedor, modelo_solicitado)
+
+    modelo_real = ""
+    if isinstance(cuerpo, dict):
+        modelo_real = str(cuerpo.get("model") or "")
+    logger.info(
+        "%s: validación local OK modelo_solicitado=%s modelo_real=%s "
+        "finish_reason=%s longitud_contenido=%d",
+        proveedor, modelo_solicitado,
+        modelo_real or "(no informado)", motivo, len(texto),
+    )
+    return {
+        "texto": texto,
+        "modelo_real": modelo_real or modelo_solicitado,
+        "finish_reason": motivo,
+    }
+
+
+def _extras_nvidia(
+    esquema: Optional[Dict[str, Any]], nombre_esquema: str, estricto: bool
+) -> Dict[str, Any]:
+    """Construye el formato de salida estructurada para NVIDIA NIM."""
+    if NVIDIA_RESPONSE_FORMAT == "guided_json" and esquema:
+        # Documentación oficial de NIM: nvext.guided_json es el mecanismo
+        # recomendado para restringir la salida a un JSON Schema.
+        return {"nvext": {"guided_json": esquema}}
+    if NVIDIA_RESPONSE_FORMAT == "json_object":
+        return {"response_format": {"type": "json_object"}}
+    return {}
+
+
+def _extras_groq(
+    esquema: Optional[Dict[str, Any]], nombre_esquema: str, estricto: bool
+) -> Dict[str, Any]:
+    """Construye el formato de salida estructurada para Groq."""
+    if GROQ_RESPONSE_FORMAT == "json_schema" and esquema:
+        return {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": nombre_esquema or "respuesta_classia",
+                    "strict": bool(estricto),
+                    "schema": esquema,
+                },
+            }
+        }
+    if GROQ_RESPONSE_FORMAT == "json_object":
+        return {"response_format": {"type": "json_object"}}
+    return {}
+
+
+def _generar_estructurado_compatible(
+    proveedor: str,
+    base_url: str,
+    api_key: str,
+    modelos: List[str],
+    instruccion: str,
+    esquema: Optional[Dict[str, Any]],
+    nombre_esquema: str,
+    estricto: bool,
+    validador: Optional[Callable[[Any], Tuple[bool, List[str]]]],
+    etapa: str,
+    modelos_agotados: Optional[Set[str]],
+    construir_extras: Callable[[Optional[Dict[str, Any]], str, bool],
+                                Dict[str, Any]],
+) -> Tuple[str, str]:
+    """
+    Recorre los modelos candidatos de un proveedor compatible con OpenAI.
+
+    - Un error de autenticación, red, límite de solicitudes o servidor afecta
+      al proveedor y no se reintenta con cada modelo.
+    - Un modelo inexistente o que rechaza el formato se omite y se prueba el
+      siguiente candidato habilitado.
+    - Un problema de contenido (vacío, truncado, JSON inválido o esquema) se
+      intenta con el siguiente modelo.
+    """
+    if not api_key:
+        raise ErrorClaveInvalida(f"No se configuró la clave de {proveedor}.")
+    lista = [m.strip() for m in (modelos or []) if m and m.strip()]
+    if not lista:
+        raise ErrorModelosAgotados(
+            f"No hay modelos configurados para {proveedor}."
+        )
+
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    errores: List[str] = []
+    for indice, modelo in enumerate(lista, 1):
+        if modelos_agotados is not None and modelo in modelos_agotados:
+            errores.append(f"{modelo}: omitido (no disponible).")
+            continue
+
+        try:
+            logger.info(
+                "%s: solicitud etapa=%s intento=%d/%d modelo=%s",
+                proveedor, etapa or "sin_etapa", indice, len(lista), modelo,
+            )
+            resultado = _solicitar_chat_compatible(
+                url=url,
+                api_key=api_key,
+                modelo=modelo,
+                instruccion=instruccion,
+                extras=construir_extras(esquema, nombre_esquema, estricto),
+            )
+            evaluado = _evaluar_respuesta_chat_compatible(
+                resultado, validador, proveedor
+            )
+            logger.info(
+                "%s: respuesta aceptada etapa=%s modelo_real=%s status=%d",
+                proveedor, etapa or "sin_etapa",
+                evaluado["modelo_real"], resultado.get("status"),
+            )
+            return evaluado["texto"], evaluado["modelo_real"]
+
+        except (
+            ErrorClaveInvalida, ErrorRed, ErrorServidor,
+            ErrorCuotaAgotada, ErrorIntegracion,
+        ):
+            # Errores del proveedor o de la cuenta: no tiene sentido probar
+            # cada modelo restante.
+            raise
+        except ErrorModeloNoDisponible as e:
+            if modelos_agotados is not None:
+                modelos_agotados.add(modelo)
+            errores.append(f"{modelo}: {e}")
+            logger.warning(
+                "%s: modelo %s no disponible; se prueba el siguiente.",
+                proveedor, modelo,
+            )
+            continue
+        except ErrorIA as e:
+            errores.append(f"{modelo}: {type(e).__name__}: {e}")
+            logger.warning(
+                "%s: intento %d/%d con %s falló (%s). Se prueba el siguiente.",
+                proveedor, indice, len(lista), modelo, type(e).__name__,
+            )
+            continue
+
+    detalle = "\n".join(errores) if errores else "No se intentó ningún modelo."
+    logger.error(
+        "%s: se agotaron los modelos configurados para la etapa %s.\n%s",
+        proveedor, etapa or "sin_etapa", detalle,
+    )
+    raise ErrorModelosAgotados(
+        f"Se agotaron los modelos configurados de {proveedor} sin una "
+        f"respuesta válida para la etapa '{etapa or 'sin_etapa'}'.\n" + detalle
+    )
+
+
+def generar_con_nvidia_estructurado(
+    instruccion: str,
+    esquema: Dict[str, Any],
+    nombre_esquema: str,
+    estricto: bool,
+    validador: Optional[Callable[[Any], Tuple[bool, List[str]]]],
+    etapa: str = "",
+    modelos: Optional[List[str]] = None,
+    api_key: Optional[str] = None,
+    modelos_agotados: Optional[Set[str]] = None,
+) -> Tuple[str, str]:
+    """
+    Genera contenido estructurado con NVIDIA NIM directamente.
+
+    No depende de OmniRoute ni de OpenRouter. La URL base y la clave se leen
+    de la configuración; nunca se imprimen.
+    """
+    return _generar_estructurado_compatible(
+        proveedor="NVIDIA",
+        base_url=NVIDIA_BASE_URL,
+        api_key=api_key if api_key is not None else NVIDIA_API_KEY,
+        modelos=list(modelos) if modelos is not None else list(NVIDIA_MODELS),
+        instruccion=instruccion,
+        esquema=esquema,
+        nombre_esquema=nombre_esquema,
+        estricto=estricto,
+        validador=validador,
+        etapa=etapa,
+        modelos_agotados=modelos_agotados,
+        construir_extras=_extras_nvidia,
+    )
+
+
+def generar_con_groq_estructurado(
+    instruccion: str,
+    esquema: Dict[str, Any],
+    nombre_esquema: str,
+    estricto: bool,
+    validador: Optional[Callable[[Any], Tuple[bool, List[str]]]],
+    etapa: str = "",
+    modelos: Optional[List[str]] = None,
+    api_key: Optional[str] = None,
+    modelos_agotados: Optional[Set[str]] = None,
+) -> Tuple[str, str]:
+    """Genera contenido estructurado con Groq directamente."""
+    return _generar_estructurado_compatible(
+        proveedor="Groq",
+        base_url=GROQ_BASE_URL,
+        api_key=api_key if api_key is not None else GROQ_API_KEY,
+        modelos=list(modelos) if modelos is not None else list(GROQ_MODELS),
+        instruccion=instruccion,
+        esquema=esquema,
+        nombre_esquema=nombre_esquema,
+        estricto=estricto,
+        validador=validador,
+        etapa=etapa,
+        modelos_agotados=modelos_agotados,
+        construir_extras=_extras_groq,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -436,13 +930,13 @@ def generar_con_openrouter(
                 "Usá un modelo con sufijo ':free' o cargá crédito en OpenRouter."
             )
         if respuesta.status_code == 429:
-            raise ErrorCuotaAgotada(
-                "Cuota de OpenRouter agotada (429). Con el plan gratuito el "
-                "límite es 50 solicitudes por día (1000 si cargaste 10 "
-                f"créditos). Detalle: {_resumen_error_http(respuesta)}"
+            raise ErrorLimiteSolicitudes(
+                "OpenRouter alcanzó un límite de solicitudes (429). Con el "
+                "plan gratuito el límite es 50 solicitudes por día (1000 si "
+                f"cargaste 10 créditos). Detalle: {_resumen_error_http(respuesta)}"
             )
         if respuesta.status_code == 404:
-            raise ErrorIA(
+            raise ErrorModeloNoDisponible(
                 f"Modelo de OpenRouter no encontrado (404): revisá "
                 f"OPENROUTER_MODEL='{modelo}'."
             )
@@ -507,16 +1001,8 @@ def generar_con_openrouter(
 # ---------------------------------------------------------------------------
 
 def _limpiar_cercas_markdown_openrouter(texto: str) -> str:
-    """Quita las cercas ``` que algunos modelos agregan alrededor del JSON."""
-    limpio = (texto or "").strip()
-    if not limpio.startswith("```"):
-        return limpio
-    lineas = limpio.splitlines()
-    if lineas and lineas[0].strip().startswith("```"):
-        lineas = lineas[1:]
-    if lineas and lineas[-1].strip().startswith("```"):
-        lineas = lineas[:-1]
-    return "\n".join(lineas).strip()
+    """Compatibilidad: limpia cercas markdown de OpenRouter."""
+    return _limpiar_cercas_markdown(texto)
 
 
 def _texto_de_contenido_openrouter(mensaje: Dict[str, Any]) -> str:
@@ -663,7 +1149,7 @@ def _evaluar_respuesta_openrouter(
             "Verificá que el modelo sea ':free' o cargá crédito."
         )
     if status == 429:
-        raise ErrorCuotaAgotada(
+        raise ErrorLimiteSolicitudes(
             "OpenRouter alcanzó un límite de solicitudes (429). "
             f"Detalle: {mensaje_error or 'sin detalle'}"
         )
@@ -692,7 +1178,11 @@ def _evaluar_respuesta_openrouter(
     if isinstance(cuerpo, dict) and cuerpo.get("error"):
         detalle = mensaje_error or "error sin detalle"
         bajo = detalle.lower()
-        if "rate limit" in bajo or "quota" in bajo or "429" in bajo:
+        if "rate limit" in bajo or "too many requests" in bajo or "429" in bajo:
+            raise ErrorLimiteSolicitudes(
+                f"OpenRouter alcanzó un límite de solicitudes: {detalle}"
+            )
+        if "quota" in bajo:
             raise ErrorCuotaAgotada(
                 f"OpenRouter devolvió un error de cuota: {detalle}"
             )
@@ -717,7 +1207,7 @@ def _evaluar_respuesta_openrouter(
     )
 
     if motivo == "length":
-        raise ErrorRespuestaIncompleta(
+        raise ErrorRespuestaTruncada(
             "OpenRouter truncó la respuesta por límite de tokens "
             "(finish_reason=length)."
         )
@@ -730,34 +1220,13 @@ def _evaluar_respuesta_openrouter(
         detalle = f"contenido final vacío (finish_reason={motivo})"
         if hubo_razonamiento:
             detalle += "; el modelo sólo devolvió razonamiento"
-        raise ErrorRespuestaIncompleta(
+        raise ErrorRespuestaVacia(
             f"OpenRouter devolvió {detalle}."
         )
 
-    limpio = _limpiar_cercas_markdown_openrouter(texto)
-    try:
-        datos = json.loads(limpio)
-    except json.JSONDecodeError as e:
-        raise ErrorRespuestaIncompleta(
-            f"OpenRouter devolvió JSON inválido o truncado: {e.msg} "
-            f"(posición {e.pos})."
-        )
-    if not isinstance(datos, (dict, list)):
-        raise ErrorRespuestaIncompleta(
-            "OpenRouter devolvió un JSON que no es objeto ni lista."
-        )
-
-    if validador is not None:
-        try:
-            ok, errores = validador(datos)
-        except Exception as e:
-            raise ErrorRespuestaInvalida(
-                f"No se pudo validar la respuesta contra el esquema: {e}"
-            )
-        if not ok:
-            raise ErrorRespuestaInvalida(
-                "; ".join(errores[:5]) or "la respuesta no cumple el esquema."
-            )
+    datos = _validar_json_texto(
+        texto, validador, "OpenRouter", modelo_solicitado
+    )
 
     modelo_real = ""
     if isinstance(cuerpo, dict):
@@ -946,6 +1415,9 @@ def generar_contenido_educativo(
     Devuelve (texto_respuesta, nombre_proveedor_usado).
     Si todos fallan, lanza un ErrorIA con el detalle de cada proveedor.
 
+    Orden objetivo: Gemini, NVIDIA, Groq, OpenRouter. Los proveedores sin
+    credenciales o sin modelos candidatos se omiten sin interrumpir el flujo.
+
     Un ErrorIntegracion (argumento no admitido por el SDK, error de
     programación) se propaga de inmediato: no es un fallo transitorio del
     proveedor y no debe reintentarse con otro proveedor ni confundirse con
@@ -956,13 +1428,15 @@ def generar_contenido_educativo(
     no volver a intentarlo (ni esperar) en los bloques siguientes: el flujo
     pasa directamente al siguiente proveedor disponible.
 
-    Cuando se pasan `esquema` y `validador`, OpenRouter usa salida
-    estructurada y prueba sus modelos gratuitos en orden. La validación local
-    se ejecuta antes de aceptar cualquier respuesta; si ningún modelo cumple,
-    se lanza ErrorModelosAgotados y el flujo de bloques no reintenta.
+    Cuando se pasan `esquema` y `validador`, todos los proveedores que lo
+    admiten usan salida estructurada y la respuesta se valida localmente antes
+    de aceptarla. Gemini no recibe el esquema en el SDK, pero su texto también
+    se analiza y valida antes de devolverlo. Si ningún modelo de un proveedor
+    cumple, se lanza ErrorModelosAgotados y el flujo de bloques no reintenta.
     """
     errores = []
     fallo_modelos: Optional[ErrorModelosAgotados] = None
+    ultimo_recuperable: Optional[ErrorIA] = None
 
     for nombre in orden_proveedores:
         nombre = nombre.strip().lower()
@@ -974,14 +1448,90 @@ def generar_contenido_educativo(
             continue
 
         if not proveedor_esta_configurado(nombre):
-            errores.append(f"{nombre}: no configurado (sin credenciales).")
+            motivo = ""
+            try:
+                motivo = motivo_proveedor_no_configurado(nombre)
+            except Exception:
+                motivo = "sin credenciales"
+            errores.append(f"{nombre}: no configurado ({motivo}).")
+            logger.info(
+                "Proveedor %s omitido: no configurado (%s).", nombre, motivo
+            )
             continue
 
         try:
             if nombre == "gemini":
                 texto = generar_con_gemini(instruccion)
+                if esquema is not None and validador is not None:
+                    _validar_json_texto(
+                        texto, validador, "Gemini", GEMINI_MODEL
+                    )
                 logger.info("Proveedor de IA usado: gemini (longitud=%d)", len(texto))
                 return texto, "gemini"
+            elif nombre == "nvidia":
+                if esquema is not None and validador is not None:
+                    texto, modelo_real = generar_con_nvidia_estructurado(
+                        instruccion=instruccion,
+                        esquema=esquema,
+                        nombre_esquema=nombre_esquema,
+                        estricto=estricto,
+                        validador=validador,
+                        etapa=etapa,
+                        modelos_agotados=modelos_agotados,
+                    )
+                else:
+                    texto, modelo_real = _generar_estructurado_compatible(
+                        proveedor="NVIDIA",
+                        base_url=NVIDIA_BASE_URL,
+                        api_key=NVIDIA_API_KEY,
+                        modelos=list(NVIDIA_MODELS),
+                        instruccion=instruccion,
+                        esquema=None,
+                        nombre_esquema=nombre_esquema,
+                        estricto=estricto,
+                        validador=None,
+                        etapa=etapa,
+                        modelos_agotados=modelos_agotados,
+                        construir_extras=_extras_nvidia,
+                    )
+                logger.info(
+                    "Proveedor de IA usado: nvidia (modelo=%s, etapa=%s, "
+                    "longitud=%d)",
+                    modelo_real, etapa or "sin_etapa", len(texto),
+                )
+                return texto, "nvidia"
+            elif nombre == "groq":
+                if esquema is not None and validador is not None:
+                    texto, modelo_real = generar_con_groq_estructurado(
+                        instruccion=instruccion,
+                        esquema=esquema,
+                        nombre_esquema=nombre_esquema,
+                        estricto=estricto,
+                        validador=validador,
+                        etapa=etapa,
+                        modelos_agotados=modelos_agotados,
+                    )
+                else:
+                    texto, modelo_real = _generar_estructurado_compatible(
+                        proveedor="Groq",
+                        base_url=GROQ_BASE_URL,
+                        api_key=GROQ_API_KEY,
+                        modelos=list(GROQ_MODELS),
+                        instruccion=instruccion,
+                        esquema=None,
+                        nombre_esquema=nombre_esquema,
+                        estricto=estricto,
+                        validador=None,
+                        etapa=etapa,
+                        modelos_agotados=modelos_agotados,
+                        construir_extras=_extras_groq,
+                    )
+                logger.info(
+                    "Proveedor de IA usado: groq (modelo=%s, etapa=%s, "
+                    "longitud=%d)",
+                    modelo_real, etapa or "sin_etapa", len(texto),
+                )
+                return texto, "groq"
             elif nombre == "openrouter":
                 if esquema is not None and validador is not None:
                     texto, modelo_real = generar_con_openrouter_estructurado(
@@ -1018,6 +1568,23 @@ def generar_contenido_educativo(
             errores.append(f"{nombre}: clave inválida ({e}).")
             logger.warning("Proveedor %s no disponible: clave inválida.", nombre)
             continue
+        except ErrorModeloNoDisponible as e:
+            errores.append(f"{nombre}: modelo no disponible ({e}).")
+            logger.warning(
+                "Proveedor %s no tiene un modelo disponible: %s", nombre, e
+            )
+            continue
+        except ErrorTimeout as e:
+            errores.append(f"{nombre}: timeout ({e}).")
+            logger.warning("Proveedor %s agotó el tiempo de espera: %s", nombre, e)
+            continue
+        except ErrorLimiteSolicitudes as e:
+            errores.append(f"{nombre}: límite de solicitudes ({e}).")
+            logger.warning(
+                "Proveedor %s alcanzó un límite de solicitudes. Se intentará "
+                "el siguiente proveedor.", nombre,
+            )
+            continue
         except ErrorCuotaAgotada as e:
             errores.append(f"{nombre}: cuota agotada ({e}).")
             if proveedores_agotados is not None and cuota_es_persistente(str(e)):
@@ -1048,8 +1615,22 @@ def generar_contenido_educativo(
             )
             continue
         except ErrorRespuestaIncompleta as e:
+            ultimo_recuperable = e
             errores.append(f"{nombre}: respuesta incompleta ({e}).")
             logger.warning("Proveedor %s devolvió una respuesta incompleta.", nombre)
+            continue
+        except ErrorRespuestaInvalida as e:
+            ultimo_recuperable = e
+            errores.append(f"{nombre}: respuesta fuera de esquema ({e}).")
+            logger.warning(
+                "Proveedor %s devolvió JSON válido pero fuera del esquema.",
+                nombre,
+            )
+            continue
+        except ErrorContenidoNoJson as e:
+            ultimo_recuperable = e
+            errores.append(f"{nombre}: contenido no JSON ({e}).")
+            logger.warning("Proveedor %s devolvió contenido que no es JSON.", nombre)
             continue
         except ErrorModelosAgotados as e:
             fallo_modelos = e
@@ -1067,13 +1648,21 @@ def generar_contenido_educativo(
     detalle = "\n".join(errores) if errores else "No se especificaron proveedores."
     if fallo_modelos is not None:
         logger.error(
-            "Se agotaron todos los modelos de OpenRouter sin respuesta "
+            "Se agotaron todos los modelos configurados sin respuesta "
             "válida.\n%s", detalle,
         )
         raise ErrorModelosAgotados(
-            "Se agotaron todos los modelos de OpenRouter sin una respuesta "
+            "Se agotaron todos los modelos configurados sin una respuesta "
             "válida.\n" + detalle
         ) from fallo_modelos
+
+    if ultimo_recuperable is not None:
+        logger.error(
+            "Ningún proveedor devolvió una respuesta válida.\n%s", detalle
+        )
+        raise type(ultimo_recuperable)(
+            "Ningún proveedor devolvió una respuesta válida.\n" + detalle
+        ) from ultimo_recuperable
 
     logger.error(
         "Se agotaron todos los proveedores de IA disponibles.\n%s", detalle
@@ -1084,7 +1673,7 @@ def generar_contenido_educativo(
 
 
 def obtener_proveedores_disponibles() -> list:
-    """Devuelve los nombres de los proveedores que tienen credenciales configuradas."""
+    """Devuelve los proveedores configurados (clave y modelos cuando aplica)."""
     from configuracion import AI_PROVIDER_ORDER
     disponibles = []
     for nombre in AI_PROVIDER_ORDER:

@@ -32,34 +32,70 @@ LOGO_PDF_POR_DEFECTO = CARPETA_ASSETS / "escudo_pdf.png"   # PDF generado
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
+# NVIDIA NIM: API alojada compatible con OpenAI.
+# La clave y los modelos son independientes: si falta cualquiera de los dos,
+# el proveedor se omite sin realizar solicitudes.
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
+NVIDIA_BASE_URL = (
+    os.getenv("NVIDIA_BASE_URL") or "https://integrate.api.nvidia.com/v1"
+).strip().rstrip("/")
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "").strip()
+NVIDIA_RESPONSE_FORMAT = os.getenv(
+    "NVIDIA_RESPONSE_FORMAT", "guided_json"
+).strip().lower()
+if NVIDIA_RESPONSE_FORMAT not in ("guided_json", "json_object", "text"):
+    NVIDIA_RESPONSE_FORMAT = "guided_json"
+
+# Groq: API compatible con OpenAI. Igual que NVIDIA, sólo se habilita cuando
+# hay clave y al menos un modelo candidato configurado.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_BASE_URL = (
+    os.getenv("GROQ_BASE_URL") or "https://api.groq.com/openai/v1"
+).strip().rstrip("/")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "").strip()
+GROQ_RESPONSE_FORMAT = os.getenv(
+    "GROQ_RESPONSE_FORMAT", "json_object"
+).strip().lower()
+if GROQ_RESPONSE_FORMAT not in ("json_schema", "json_object", "text"):
+    GROQ_RESPONSE_FORMAT = "json_object"
+
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 
 
-def _modelos_openrouter_configurados() -> list:
+def _modelos_configurados(preferido: str, variable_lista: str) -> list:
     """
-    Devuelve la lista ordenada de modelos de OpenRouter.
+    Devuelve la lista ordenada de modelos de un proveedor.
 
-    `OPENROUTER_MODEL` es el modelo preferido y se intenta primero.
-    `OPENROUTER_MODELS` aporta los candidatos restantes (separados por comas).
-    Se mantiene `OPENROUTER_MODEL` por compatibilidad con configuraciones
-    anteriores que sólo definían esa variable.
+    El modelo preferido se intenta primero. La variable de lista aporta los
+    candidatos restantes (separados por comas). Se deduplica y se ignoran los
+    valores vacíos. No se agregan modelos por defecto: cada candidato debe
+    estar habilitado explícitamente en la configuración.
     """
-    preferido = (OPENROUTER_MODEL or "").strip()
-    crudo = os.getenv("OPENROUTER_MODELS", "")
-    candidatos = [m.strip() for m in crudo.split(",") if m.strip()]
     orden = []
+    preferido = (preferido or "").strip()
     if preferido:
         orden.append(preferido)
-    for modelo in candidatos:
-        if modelo not in orden:
+    crudo = os.getenv(variable_lista, "")
+    for modelo in (m.strip() for m in crudo.split(",")):
+        if modelo and modelo not in orden:
             orden.append(modelo)
     return orden
+
+
+def _modelos_openrouter_configurados() -> list:
+    """Compatibilidad histórica para la lista de modelos de OpenRouter."""
+    return _modelos_configurados(OPENROUTER_MODEL, "OPENROUTER_MODELS")
 
 
 # Candidatos gratuitos de OpenRouter, en orden de intento. Nunca se agregan
 # modelos de pago automáticamente: la lista se configura en .env.
 OPENROUTER_MODELS = _modelos_openrouter_configurados()
+
+# Los identificadores de NVIDIA y Groq son candidatos configurables, no una
+# lista de modelos verificados. No se habilita ninguno por defecto.
+NVIDIA_MODELS = _modelos_configurados(NVIDIA_MODEL, "NVIDIA_MODELS")
+GROQ_MODELS = _modelos_configurados(GROQ_MODEL, "GROQ_MODELS")
 
 # Formato de salida estructurada para OpenRouter:
 # - "json_schema": JSON Schema estricto por etapa (recomendado).
@@ -75,8 +111,21 @@ OMNIROUTE_BASE_URL = os.getenv("OMNIROUTE_BASE_URL", "")
 OMNIROUTE_API_KEY = os.getenv("OMNIROUTE_API_KEY", "")
 OMNIROUTE_MODEL = os.getenv("OMNIROUTE_MODEL", "")
 
-# Orden de proveedores (por defecto: Gemini primero, luego OpenRouter)
-AI_PROVIDER_ORDER = os.getenv("AI_PROVIDER_ORDER", "gemini,openrouter").split(",")
+def _normalizar_orden_proveedores(texto: str) -> list:
+    """Convierte una lista separada por comas en nombres únicos y ordenados."""
+    orden = []
+    for nombre in (texto or "").split(","):
+        nombre = nombre.strip().lower()
+        if nombre and nombre not in orden:
+            orden.append(nombre)
+    return orden
+
+
+# Orden de proveedores. Gemini primero; NVIDIA y Groq sólo se usan si están
+# configurados; OpenRouter queda como respaldo final.
+AI_PROVIDER_ORDER = _normalizar_orden_proveedores(
+    os.getenv("AI_PROVIDER_ORDER", "gemini,nvidia,groq,openrouter")
+)
 
 # --- Límites de solicitud ---
 def _entero_desde_entorno(nombre: str, por_defecto: int,
@@ -140,15 +189,55 @@ STRICT_FREE_IMAGE_MODE = os.getenv("STRICT_FREE_IMAGE_MODE", "1") == "1"
 def proveedor_esta_configurado(nombre_proveedor: str) -> bool:
     """
     Devuelve True si el proveedor tiene las credenciales mínimas configuradas.
+
+    En NVIDIA y Groq no alcanza con la clave: también debe haber al menos un
+    modelo candidato habilitado. Así una clave presente no dispara solicitudes
+    a modelos que el usuario no eligió.
     """
     nombre_proveedor = nombre_proveedor.lower().strip()
     if nombre_proveedor == "gemini":
         return bool(GEMINI_API_KEY)
+    if nombre_proveedor == "nvidia":
+        return bool(NVIDIA_API_KEY) and bool(NVIDIA_MODELS)
+    if nombre_proveedor == "groq":
+        return bool(GROQ_API_KEY) and bool(GROQ_MODELS)
     if nombre_proveedor == "openrouter":
         return bool(OPENROUTER_API_KEY)
     if nombre_proveedor == "omniroute":
         return bool(OMNIROUTE_BASE_URL) and bool(OMNIROUTE_API_KEY)
     return False
+
+
+def motivo_proveedor_no_configurado(nombre_proveedor: str) -> str:
+    """
+    Explica por qué un proveedor se omite, sin exponer credenciales.
+
+    Se usa sólo para diagnóstico y mensajes de error.
+    """
+    nombre_proveedor = nombre_proveedor.lower().strip()
+    if nombre_proveedor == "gemini":
+        return "falta GEMINI_API_KEY"
+    if nombre_proveedor == "nvidia":
+        if not NVIDIA_API_KEY:
+            return "falta NVIDIA_API_KEY"
+        if not NVIDIA_MODELS:
+            return "falta NVIDIA_MODEL o NVIDIA_MODELS"
+        return "configurado"
+    if nombre_proveedor == "groq":
+        if not GROQ_API_KEY:
+            return "falta GROQ_API_KEY"
+        if not GROQ_MODELS:
+            return "falta GROQ_MODEL o GROQ_MODELS"
+        return "configurado"
+    if nombre_proveedor == "openrouter":
+        return "falta OPENROUTER_API_KEY" if not OPENROUTER_API_KEY else "configurado"
+    if nombre_proveedor == "omniroute":
+        if not OMNIROUTE_BASE_URL:
+            return "falta OMNIROUTE_BASE_URL"
+        if not OMNIROUTE_API_KEY:
+            return "falta OMNIROUTE_API_KEY"
+        return "configurado"
+    return "proveedor desconocido"
 
 
 def proveedores_habilitados() -> list:
